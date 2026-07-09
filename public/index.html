@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>KhetSe — Farm Direct Marketplace</title>
+<link rel="stylesheet" href="/css/main.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Playfair+Display:ital,wght@0,700;0,900;1,700&display=swap">
+</head>
+<body>
+
+<!-- NAV -->
+<nav id="main-nav">
+  <div class="nav-inner">
+    <a class="nav-brand" href="#" onclick="navigate('home')">
+      <div class="nav-logo">K</div>
+      <span class="nav-name">Khet<span>Se</span></span>
+    </a>
+    <div class="nav-links" id="nav-links">
+      <a href="#" onclick="navigate('shop')">Browse</a>
+      <a href="#" onclick="navigate('farmers')">Farmers</a>
+      <a href="#" onclick="navigate('subscribe')">Subscribe</a>
+      <a href="#" onclick="navigate('community')">Community</a>
+    </div>
+    <div class="nav-right">
+      <div id="nav-auth-guest" class="nav-auth-area">
+        <a class="nav-btn-ghost" onclick="navigate('login')">Log in</a>
+        <a class="nav-btn-primary" onclick="navigate('register')">Join KhetSe</a>
+      </div>
+      <div id="nav-auth-user" class="nav-auth-area" style="display:none">
+        <a class="nav-cart-btn" onclick="navigate('cart')">🛒 <span id="cart-count">0</span></a>
+        <div class="nav-user-menu">
+          <button class="nav-user-btn" onclick="toggleUserMenu()">
+            <span id="nav-user-name">Account</span> ▾
+          </button>
+          <div class="user-dropdown" id="user-dropdown">
+            <a onclick="navigate('dashboard')">Dashboard</a>
+            <a onclick="navigate('orders')">My Orders</a>
+            <a onclick="navigate('subscriptions')">My Subscriptions</a>
+            <div id="farmer-nav-links" style="display:none">
+              <hr>
+              <a onclick="navigate('my-listings')">My Listings</a>
+              <a onclick="navigate('add-product')">Add Product</a>
+            </div>
+            <div id="admin-nav-links" style="display:none">
+              <hr>
+              <a onclick="navigate('admin')">Admin Panel</a>
+            </div>
+            <hr>
+            <a onclick="logout()">Log out</a>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</nav>
+
+<!-- MAIN CONTENT -->
+<main id="app-main"></main>
+
+<!-- TOAST -->
+<div id="toast-container"></div>
+
+<!-- MODALS -->
+<div id="modal-overlay" style="display:none" onclick="closeModal()">
+  <div id="modal-box" onclick="event.stopPropagation()"></div>
+</div>
+
+<script src="/js/app.js"></script>
+</body>
+</html>
