@@ -145,6 +145,7 @@ async function renderPage(page, params = {}) {
       case 'add-product': renderAddProduct(); break;
       case 'farmer-register': renderFarmerRegister(); break;
       case 'admin': await renderAdmin(); break;
+      case 'profile': await renderProfile(); break;
       default: navigate('home');
     }
   } catch (e) {
@@ -1541,6 +1542,242 @@ function renderFooter() {
       </div>
     </footer>
   `;
+}
+
+// ─── PROFILE PAGE ─────────────────────────────────────────────────────────────
+async function renderProfile() {
+  if (!currentUser) return navigate('login');
+  const el = main();
+  const { user, farmer } = await api('/api/auth/me');
+
+  el.innerHTML = `
+    <div class="page-header">
+      <div class="container">
+        <div class="page-eyebrow">Account</div>
+        <h1 class="page-title">Edit Profile</h1>
+        <p class="page-sub">Update your personal details, farm information, and password.</p>
+      </div>
+    </div>
+    <section class="section section-light">
+      <div class="container" style="max-width:760px">
+
+        <!-- Personal Details -->
+        <div class="card mb-24">
+          <div class="card-header">
+            <strong>Personal Details</strong>
+            <p class="text-small text-muted mt-4">Your name and phone number visible to buyers and the platform.</p>
+          </div>
+          <div class="card-body">
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label">Full name</label>
+                <input type="text" class="form-input" id="prof-name" value="${user.name}">
+              </div>
+              <div class="form-group">
+                <label class="form-label">Phone number</label>
+                <input type="text" class="form-input" id="prof-phone" value="${user.phone}">
+              </div>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Email address</label>
+              <input type="email" class="form-input" value="${user.email}" disabled
+                style="background:var(--parchment);color:#8A7A68;cursor:not-allowed">
+              <p class="form-hint">Email cannot be changed. Contact support if needed.</p>
+            </div>
+            ${farmer ? `
+              <div class="form-group">
+                <label class="form-label">Farm / family name</label>
+                <input type="text" class="form-input" id="prof-farm-name" value="${farmer.farm_name || ''}">
+              </div>
+              <div class="form-group">
+                <label class="form-label">Farm bio</label>
+                <textarea class="form-input form-textarea" id="prof-bio" placeholder="Tell customers about your farm, crops, and farming practices…">${farmer.bio || ''}</textarea>
+              </div>
+            ` : ''}
+          </div>
+          <div class="card-footer">
+            <button class="btn btn-primary" onclick="saveProfile()">Save changes</button>
+          </div>
+        </div>
+
+        <!-- Farmer docs update (if rejected or pending) -->
+        ${farmer && farmer.verification_status !== 'verified' ? `
+        <div class="card mb-24" style="border-color:var(--saffron)">
+          <div class="card-header" style="background:#FBF3E1">
+            <strong style="color:#7A5B00">Update Verification Documents</strong>
+            <p class="text-small mt-4" style="color:#7A5B00">
+              ${farmer.verification_status === 'rejected'
+                ? '⚠️ Your verification was not approved. Correct your documents below and resubmit.'
+                : '⏳ Verification is pending. You can update your documents before review completes.'}
+            </p>
+          </div>
+          <div class="card-body">
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label">Aadhaar — last 4 digits</label>
+                <input type="text" class="form-input" id="upd-aadhaar" value="${farmer.aadhaar_last4 || ''}" maxlength="4">
+              </div>
+              <div class="form-group">
+                <label class="form-label">PM-Kisan ID</label>
+                <input type="text" class="form-input" id="upd-pmkisan" value="${farmer.pm_kisan_id || ''}" placeholder="e.g. PMK-MH-2024-4871">
+              </div>
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label">Land record number</label>
+                <input type="text" class="form-input" id="upd-landrec" value="${farmer.land_record_number || ''}" placeholder="e.g. MH-NK-7/12-2201">
+              </div>
+              <div class="form-group">
+                <label class="form-label">eNAM ID (if any)</label>
+                <input type="text" class="form-input" id="upd-enam" value="${farmer.enam_id || ''}">
+              </div>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Soil Health Card</label>
+              <input type="text" class="form-input" id="upd-shc" value="${farmer.soil_health_card || ''}">
+            </div>
+          </div>
+          <div class="card-footer">
+            <button class="btn btn-primary" onclick="resubmitVerification()">Resubmit for verification</button>
+          </div>
+        </div>
+        ` : ''}
+
+        <!-- Verified farmer — show status card instead -->
+        ${farmer && farmer.verification_status === 'verified' ? `
+        <div class="card mb-24">
+          <div class="card-body">
+            <div class="flex gap-12" style="align-items:center">
+              <span style="font-size:32px">✅</span>
+              <div>
+                <strong>Your farm is verified</strong>
+                <p class="text-small text-muted mt-4">
+                  Verified on ${formatDate(farmer.verification_date)} ·
+                  Commission tier: <span class="badge badge-${farmer.commission_tier}">${farmer.commission_tier}</span>
+                </p>
+              </div>
+            </div>
+          </div>
+        </div>
+        ` : ''}
+
+        <!-- Change Password -->
+        <div class="card">
+          <div class="card-header">
+            <strong>Change Password</strong>
+            <p class="text-small text-muted mt-4">A confirmation email will be sent to ${user.email} when you change your password.</p>
+          </div>
+          <div class="card-body">
+            <div class="form-group">
+              <label class="form-label">Current password</label>
+              <input type="password" class="form-input" id="pwd-current" placeholder="Enter your current password">
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label">New password</label>
+                <input type="password" class="form-input" id="pwd-new" placeholder="At least 6 characters"
+                  oninput="checkPasswordStrength(this.value)">
+                <div id="pwd-strength" style="margin-top:6px;font-size:12px;font-weight:600"></div>
+              </div>
+              <div class="form-group">
+                <label class="form-label">Confirm new password</label>
+                <input type="password" class="form-input" id="pwd-confirm" placeholder="Repeat new password">
+              </div>
+            </div>
+          </div>
+          <div class="card-footer">
+            <button class="btn btn-primary" onclick="changePassword()">Update password</button>
+          </div>
+        </div>
+
+        <!-- Danger zone -->
+        <div class="card mt-24" style="border-color:#FFCDD2">
+          <div class="card-header" style="background:#FFEBEE">
+            <strong style="color:#C62828">Account</strong>
+          </div>
+          <div class="card-body">
+            <div class="flex-between">
+              <div>
+                <strong>Member since</strong>
+                <p class="text-small text-muted">${formatDate(user.created_at)}</p>
+              </div>
+              <div>
+                <strong>Account type</strong>
+                <p class="text-small text-muted" style="text-transform:capitalize">${user.role}</p>
+              </div>
+              <button class="btn btn-outline btn-sm" style="color:#C62828;border-color:#FFCDD2" onclick="logout()">Log out</button>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </section>
+    ${renderFooter()}
+  `;
+}
+
+async function saveProfile() {
+  const name = $('prof-name')?.value?.trim();
+  const phone = $('prof-phone')?.value?.trim();
+  const bio = $('prof-bio')?.value?.trim();
+  const farm_name = $('prof-farm-name')?.value?.trim();
+  if (!name || !phone) { toast('Name and phone required', 'error'); return; }
+  try {
+    const { user } = await api('/api/auth/profile', {
+      method: 'PUT',
+      body: JSON.stringify({ name, phone, bio, farm_name })
+    });
+    currentUser = { ...currentUser, name: user.name, phone: user.phone };
+    updateNavForUser();
+    toast('Profile updated ✓', 'success');
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function resubmitVerification() {
+  const data = {
+    aadhaar_last4: $('upd-aadhaar')?.value?.trim(),
+    pm_kisan_id: $('upd-pmkisan')?.value?.trim(),
+    land_record_number: $('upd-landrec')?.value?.trim(),
+    enam_id: $('upd-enam')?.value?.trim(),
+    soil_health_card: $('upd-shc')?.value?.trim(),
+  };
+  if (!data.aadhaar_last4) { toast('Aadhaar last 4 digits required', 'error'); return; }
+  try {
+    await api('/api/farmers/profile', { method: 'PUT', body: JSON.stringify(data) });
+    toast('Documents resubmitted — we\'ll review within 24–48 hours ✓', 'success');
+    await renderProfile();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+function checkPasswordStrength(pwd) {
+  const el = $('pwd-strength');
+  if (!el) return;
+  if (!pwd) { el.textContent = ''; return; }
+  const score = [pwd.length >= 8, /[A-Z]/.test(pwd), /[0-9]/.test(pwd), /[^A-Za-z0-9]/.test(pwd)].filter(Boolean).length;
+  const labels = ['', 'Weak', 'Fair', 'Good', 'Strong'];
+  const colors = ['', '#C62828', '#E65100', '#2E7D32', '#1B5E20'];
+  el.textContent = labels[score] || 'Weak';
+  el.style.color = colors[score] || '#C62828';
+}
+
+async function changePassword() {
+  const current = $('pwd-current')?.value;
+  const newPwd = $('pwd-new')?.value;
+  const confirm = $('pwd-confirm')?.value;
+  if (!current || !newPwd || !confirm) { toast('All password fields required', 'error'); return; }
+  if (newPwd !== confirm) { toast('New passwords do not match', 'error'); return; }
+  if (newPwd.length < 6) { toast('New password must be at least 6 characters', 'error'); return; }
+  try {
+    await api('/api/auth/password', {
+      method: 'PUT',
+      body: JSON.stringify({ current_password: current, new_password: newPwd })
+    });
+    toast('Password changed! A confirmation email has been sent. ✓', 'success');
+    $('pwd-current').value = '';
+    $('pwd-new').value = '';
+    $('pwd-confirm').value = '';
+    $('pwd-strength').textContent = '';
+  } catch (e) { toast(e.message, 'error'); }
 }
 
 // ─── INIT ─────────────────────────────────────────────────────────────────────

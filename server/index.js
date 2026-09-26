@@ -7,13 +7,18 @@ const multer = require('multer');
 const { getDb, run, get, all, save } = require('./db');
 const { signToken, requireAuth, requireRole } = require('./auth');
 const { calculateCommission, determineTier } = require('./commission');
+const email = require('./email');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Multer for photo uploads
+const UPLOAD_DIR = path.join(process.env.DATA_DIR || path.join(__dirname, '..'), 'uploads');
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, path.join(__dirname, '../uploads')),
+  destination: (req, file, cb) => {
+    const fs = require('fs');
+    if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+    cb(null, UPLOAD_DIR);
+  },
   filename: (req, file, cb) => cb(null, uuid() + path.extname(file.originalname))
 });
 const upload = multer({ storage, limits: { fileSize: 5 * 1024 * 1024 } });
@@ -21,81 +26,178 @@ const upload = multer({ storage, limits: { fileSize: 5 * 1024 * 1024 } });
 app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, '../public')));
-app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
+app.use('/uploads', express.static(UPLOAD_DIR));
 
-// ─── HEALTH CHECK ───────────────────────────────────────────
+// ─── HEALTH ──────────────────────────────────────────────────────────────────
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', platform: 'KhetSe', version: '1.0.0-dev' });
+  res.json({ status: 'ok', platform: 'KhetSe', version: '1.1.0' });
 });
 
-// ─── AUTH ────────────────────────────────────────────────────
+// ─── AUTH — REGISTER ─────────────────────────────────────────────────────────
 app.post('/api/auth/register', async (req, res) => {
   try {
     await getDb();
-    const { name, email, phone, password, role = 'customer' } = req.body;
-    if (!name || !email || !phone || !password) return res.status(400).json({ error: 'All fields required' });
-    const exists = get('SELECT id FROM users WHERE email=? OR phone=?', [email, phone]);
+    const { name, email: userEmail, phone, password, role = 'customer' } = req.body;
+    if (!name || !userEmail || !phone || !password) return res.status(400).json({ error: 'All fields required' });
+    if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    const exists = get('SELECT id FROM users WHERE email=? OR phone=?', [userEmail, phone]);
     if (exists) return res.status(409).json({ error: 'Email or phone already registered' });
+    const safeRole = role === 'admin' ? 'customer' : role;
     const hash = bcrypt.hashSync(password, 10);
     const id = uuid();
     run('INSERT INTO users (id,name,email,phone,password_hash,role) VALUES (?,?,?,?,?,?)',
-      [id, name, email, phone, hash, role === 'admin' ? 'customer' : role]);
-    const token = signToken({ id, name, email, role: role === 'admin' ? 'customer' : role });
-    res.json({ token, user: { id, name, email, phone, role: role === 'admin' ? 'customer' : role } });
+      [id, name, userEmail, phone, hash, safeRole]);
+    const token = signToken({ id, name, email: userEmail, role: safeRole });
+    // Welcome email — fire-and-forget, don't block the response
+    const user = { id, name, email: userEmail, phone, role: safeRole };
+    if (safeRole === 'customer') email.sendWelcomeCustomer(user).catch(() => {});
+    else if (safeRole === 'farmer') email.sendWelcomeFarmer(user).catch(() => {});
+    res.json({ token, user });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ─── AUTH — LOGIN ─────────────────────────────────────────────────────────────
 app.post('/api/auth/login', async (req, res) => {
   try {
     await getDb();
-    const { email, password } = req.body;
-    if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
-    const user = get('SELECT * FROM users WHERE email=?', [email]);
-    if (!user) return res.status(401).json({ error: 'Invalid credentials' });
-    if (!bcrypt.compareSync(password, user.password_hash)) return res.status(401).json({ error: 'Invalid credentials' });
+    const { email: userEmail, password } = req.body;
+    if (!userEmail || !password) return res.status(400).json({ error: 'Email and password required' });
+    const user = get('SELECT * FROM users WHERE email=?', [userEmail]);
+    if (!user || !bcrypt.compareSync(password, user.password_hash))
+      return res.status(401).json({ error: 'Invalid credentials' });
     const token = signToken({ id: user.id, name: user.name, email: user.email, role: user.role });
     res.json({ token, user: { id: user.id, name: user.name, email: user.email, phone: user.phone, role: user.role } });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ─── AUTH — ME ────────────────────────────────────────────────────────────────
 app.get('/api/auth/me', requireAuth, async (req, res) => {
   await getDb();
   const user = get('SELECT id,name,email,phone,role,created_at FROM users WHERE id=?', [req.user.id]);
   if (!user) return res.status(404).json({ error: 'User not found' });
-  let farmer = null;
-  if (user.role === 'farmer') {
-    farmer = get('SELECT * FROM farmers WHERE user_id=?', [user.id]);
-  }
+  const farmer = user.role === 'farmer' ? get('SELECT * FROM farmers WHERE user_id=?', [user.id]) : null;
   res.json({ user, farmer });
 });
 
-// ─── FARMER REGISTRATION + VERIFICATION ─────────────────────
+// ─── PROFILE — UPDATE NAME/PHONE/BIO ─────────────────────────────────────────
+app.put('/api/auth/profile', requireAuth, async (req, res) => {
+  try {
+    await getDb();
+    const { name, phone } = req.body;
+    if (!name || !phone) return res.status(400).json({ error: 'Name and phone required' });
+    // Check phone not taken by another user
+    const conflict = get('SELECT id FROM users WHERE phone=? AND id!=?', [phone, req.user.id]);
+    if (conflict) return res.status(409).json({ error: 'Phone number already in use' });
+    run('UPDATE users SET name=?, phone=? WHERE id=?', [name, phone, req.user.id]);
+    // If farmer, also allow bio + farm name update
+    if (req.body.bio !== undefined || req.body.farm_name !== undefined) {
+      const farmer = get('SELECT id FROM farmers WHERE user_id=?', [req.user.id]);
+      if (farmer) {
+        if (req.body.bio !== undefined) run('UPDATE farmers SET bio=? WHERE id=?', [req.body.bio, farmer.id]);
+        if (req.body.farm_name !== undefined) run('UPDATE farmers SET farm_name=? WHERE id=?', [req.body.farm_name, farmer.id]);
+      }
+    }
+    const updated = get('SELECT id,name,email,phone,role FROM users WHERE id=?', [req.user.id]);
+    res.json({ user: updated });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── PROFILE — CHANGE PASSWORD ────────────────────────────────────────────────
+app.put('/api/auth/password', requireAuth, async (req, res) => {
+  try {
+    await getDb();
+    const { current_password, new_password } = req.body;
+    if (!current_password || !new_password) return res.status(400).json({ error: 'Current and new password required' });
+    if (new_password.length < 6) return res.status(400).json({ error: 'New password must be at least 6 characters' });
+    const user = get('SELECT * FROM users WHERE id=?', [req.user.id]);
+    if (!bcrypt.compareSync(current_password, user.password_hash))
+      return res.status(401).json({ error: 'Current password is incorrect' });
+    run('UPDATE users SET password_hash=? WHERE id=?', [bcrypt.hashSync(new_password, 10), req.user.id]);
+    // Security notification email — fire-and-forget
+    email.sendPasswordChanged(user).catch(() => {});
+    res.json({ success: true, message: 'Password updated. A confirmation email has been sent.' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── FARMERS — REGISTER ───────────────────────────────────────────────────────
 app.post('/api/farmers/register', requireAuth, async (req, res) => {
   try {
     await getDb();
     const { farm_name, village, district, state, land_acres, aadhaar_last4, pm_kisan_id, land_record_number, enam_id, soil_health_card, bio } = req.body;
-    if (!village || !district || !state) return res.status(400).json({ error: 'Location required' });
+    if (!village || !district || !state) return res.status(400).json({ error: 'Village, district, and state are required' });
+    if (!aadhaar_last4) return res.status(400).json({ error: 'Aadhaar last 4 digits required' });
     const existing = get('SELECT id FROM farmers WHERE user_id=?', [req.user.id]);
-    if (existing) return res.status(409).json({ error: 'Farmer profile already exists' });
-    // Update user role
+    if (existing) return res.status(409).json({ error: 'Farmer profile already exists. Use the update endpoint.' });
     run('UPDATE users SET role=? WHERE id=?', ['farmer', req.user.id]);
     const id = uuid();
     run(`INSERT INTO farmers (id,user_id,farm_name,village,district,state,land_acres,aadhaar_last4,pm_kisan_id,land_record_number,enam_id,soil_health_card,bio)
          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-      [id, req.user.id, farm_name || '', village, district, state, land_acres || 0, aadhaar_last4 || '', pm_kisan_id || '', land_record_number || '', enam_id || '', soil_health_card || '', bio || '']);
+      [id, req.user.id, farm_name || '', village, district, state, land_acres || 0,
+       aadhaar_last4, pm_kisan_id || '', land_record_number || '', enam_id || '', soil_health_card || '', bio || '']);
     const farmer = get('SELECT * FROM farmers WHERE id=?', [id]);
+    const user = get('SELECT * FROM users WHERE id=?', [req.user.id]);
+    // Email farmer: submission confirmed
+    email.sendVerificationSubmitted(user, farmer).catch(() => {});
+    // Email admin: new submission needs review
+    email.sendAdminNewFarmer(farmer, user).catch(() => {});
     res.json({ farmer });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Admin: verify farmer
-app.put('/api/farmers/:id/verify', requireAuth, requireRole('admin'), async (req, res) => {
-  await getDb();
-  const { status } = req.body; // 'verified' or 'rejected'
-  run(`UPDATE farmers SET verification_status=?, verification_date=datetime('now') WHERE id=?`, [status, req.params.id]);
-  res.json({ success: true, status });
+// ─── FARMERS — UPDATE PROFILE ─────────────────────────────────────────────────
+app.put('/api/farmers/profile', requireAuth, requireRole('farmer'), async (req, res) => {
+  try {
+    await getDb();
+    const farmer = get('SELECT * FROM farmers WHERE user_id=?', [req.user.id]);
+    if (!farmer) return res.status(404).json({ error: 'Farmer profile not found' });
+    const { farm_name, village, district, state, land_acres, bio, pm_kisan_id, land_record_number, enam_id, soil_health_card, aadhaar_last4 } = req.body;
+    // If submitting fresh docs while pending/rejected, reset to pending and re-notify
+    const wasRejected = farmer.verification_status === 'rejected';
+    const hasNewDocs = aadhaar_last4 || pm_kisan_id || land_record_number;
+    const newStatus = hasNewDocs && (wasRejected || farmer.verification_status === 'pending')
+      ? 'pending' : farmer.verification_status;
+    run(`UPDATE farmers SET
+          farm_name=COALESCE(?,farm_name), village=COALESCE(?,village),
+          district=COALESCE(?,district), state=COALESCE(?,state),
+          land_acres=COALESCE(?,land_acres), bio=COALESCE(?,bio),
+          pm_kisan_id=COALESCE(?,pm_kisan_id), land_record_number=COALESCE(?,land_record_number),
+          enam_id=COALESCE(?,enam_id), soil_health_card=COALESCE(?,soil_health_card),
+          aadhaar_last4=COALESCE(?,aadhaar_last4), verification_status=?
+        WHERE id=?`,
+      [farm_name||null, village||null, district||null, state||null, land_acres||null,
+       bio||null, pm_kisan_id||null, land_record_number||null, enam_id||null,
+       soil_health_card||null, aadhaar_last4||null, newStatus, farmer.id]);
+    const updated = get('SELECT * FROM farmers WHERE id=?', [farmer.id]);
+    const user = get('SELECT * FROM users WHERE id=?', [req.user.id]);
+    if (hasNewDocs && newStatus === 'pending') {
+      email.sendVerificationSubmitted(user, updated).catch(() => {});
+      email.sendAdminNewFarmer(updated, user).catch(() => {});
+    }
+    res.json({ farmer: updated });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ─── FARMERS — ADMIN VERIFY ───────────────────────────────────────────────────
+app.put('/api/farmers/:id/verify', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    await getDb();
+    const { status, reason } = req.body;
+    if (!['verified', 'rejected'].includes(status)) return res.status(400).json({ error: 'status must be verified or rejected' });
+    run(`UPDATE farmers SET verification_status=?, verification_date=datetime('now') WHERE id=?`, [status, req.params.id]);
+    // Send status email to farmer
+    const farmer = get('SELECT * FROM farmers WHERE id=?', [req.params.id]);
+    if (farmer) {
+      const user = get('SELECT * FROM users WHERE id=?', [farmer.user_id]);
+      if (user) {
+        if (status === 'verified') email.sendFarmerApproved(user, farmer).catch(() => {});
+        else email.sendFarmerRejected(user, reason || null).catch(() => {});
+      }
+    }
+    res.json({ success: true, status });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── FARMERS — LIST / GET ─────────────────────────────────────────────────────
 app.get('/api/farmers', async (req, res) => {
   await getDb();
   const { state, status, verified_only } = req.query;
@@ -116,14 +218,13 @@ app.get('/api/farmers/:id', async (req, res) => {
   res.json({ farmer, products });
 });
 
-// ─── PRODUCTS ────────────────────────────────────────────────
+// ─── PRODUCTS ─────────────────────────────────────────────────────────────────
 app.get('/api/products', async (req, res) => {
   await getDb();
   const { category, q, min_price, max_price, organic, state } = req.query;
-  let sql = `SELECT p.*, f.district, f.state, f.verification_status, f.rating as farmer_rating, f.trust_badge, u.name as farmer_name, f.id as farmer_id_real
-             FROM products p
-             JOIN farmers f ON p.farmer_id=f.id
-             JOIN users u ON f.user_id=u.id
+  let sql = `SELECT p.*, f.district, f.state, f.verification_status, f.rating as farmer_rating,
+             f.trust_badge, u.name as farmer_name, f.id as farmer_id_real
+             FROM products p JOIN farmers f ON p.farmer_id=f.id JOIN users u ON f.user_id=u.id
              WHERE p.is_active=1 AND f.verification_status='verified'`;
   const params = [];
   if (category) { sql += ' AND p.category=?'; params.push(category); }
@@ -138,7 +239,8 @@ app.get('/api/products', async (req, res) => {
 
 app.get('/api/products/:id', async (req, res) => {
   await getDb();
-  const p = get(`SELECT p.*, f.district, f.state, f.verification_status, f.rating as farmer_rating, f.trust_badge, f.bio as farmer_bio, f.commission_tier, u.name as farmer_name, f.id as farmer_id_real
+  const p = get(`SELECT p.*, f.district, f.state, f.verification_status, f.rating as farmer_rating,
+                 f.trust_badge, f.bio as farmer_bio, f.commission_tier, u.name as farmer_name, f.id as farmer_id_real
                  FROM products p JOIN farmers f ON p.farmer_id=f.id JOIN users u ON f.user_id=u.id
                  WHERE p.id=?`, [req.params.id]);
   if (!p) return res.status(404).json({ error: 'Product not found' });
@@ -157,7 +259,8 @@ app.post('/api/products', requireAuth, requireRole('farmer'), upload.single('pho
     const photo = req.file ? '/uploads/' + req.file.filename : null;
     run(`INSERT INTO products (id,farmer_id,name,category,description,price_per_unit,unit,quantity_available,min_order,photo,is_organic,harvest_date)
          VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
-      [id, farmer.id, name, category, description || '', parseFloat(price_per_unit), unit, parseFloat(quantity_available), parseFloat(min_order || 1), photo, is_organic === '1' ? 1 : 0, harvest_date || null]);
+      [id, farmer.id, name, category, description || '', parseFloat(price_per_unit), unit,
+       parseFloat(quantity_available), parseFloat(min_order || 1), photo, is_organic === '1' ? 1 : 0, harvest_date || null]);
     res.json({ product: get('SELECT * FROM products WHERE id=?', [id]) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -168,18 +271,21 @@ app.put('/api/products/:id', requireAuth, requireRole('farmer'), async (req, res
   const product = get('SELECT * FROM products WHERE id=?', [req.params.id]);
   if (!product) return res.status(404).json({ error: 'Product not found' });
   if (product.farmer_id !== farmer?.id) return res.status(403).json({ error: 'Not your product' });
-  const { price_per_unit, quantity_available, is_active } = req.body;
+  const { price_per_unit, quantity_available, is_active, description } = req.body;
   if (price_per_unit) run('UPDATE products SET price_per_unit=? WHERE id=?', [parseFloat(price_per_unit), req.params.id]);
   if (quantity_available !== undefined) run('UPDATE products SET quantity_available=? WHERE id=?', [parseFloat(quantity_available), req.params.id]);
   if (is_active !== undefined) run('UPDATE products SET is_active=? WHERE id=?', [is_active ? 1 : 0, req.params.id]);
+  if (description !== undefined) run('UPDATE products SET description=? WHERE id=?', [description, req.params.id]);
   res.json({ product: get('SELECT * FROM products WHERE id=?', [req.params.id]) });
 });
 
-// ─── CART ────────────────────────────────────────────────────
+// ─── CART ─────────────────────────────────────────────────────────────────────
 app.get('/api/cart', requireAuth, async (req, res) => {
   await getDb();
-  const items = all(`SELECT c.*, p.name, p.price_per_unit, p.unit, p.quantity_available, u.name as farmer_name, f.state
-                     FROM carts c JOIN products p ON c.product_id=p.id JOIN farmers f ON p.farmer_id=f.id JOIN users u ON f.user_id=u.id
+  const items = all(`SELECT c.*, p.name, p.price_per_unit, p.unit, p.quantity_available, p.category,
+                     u.name as farmer_name, f.state
+                     FROM carts c JOIN products p ON c.product_id=p.id
+                     JOIN farmers f ON p.farmer_id=f.id JOIN users u ON f.user_id=u.id
                      WHERE c.customer_id=?`, [req.user.id]);
   const total = items.reduce((s, i) => s + i.price_per_unit * i.quantity, 0);
   res.json({ items, total: parseFloat(total.toFixed(2)) });
@@ -205,13 +311,13 @@ app.delete('/api/cart/:product_id', requireAuth, async (req, res) => {
   res.json({ success: true });
 });
 
-// ─── ORDERS ─────────────────────────────────────────────────
+// ─── ORDERS ───────────────────────────────────────────────────────────────────
 app.post('/api/orders', requireAuth, async (req, res) => {
   try {
     await getDb();
     const { shipping_address, shipping_pincode, payment_method = 'cod', notes } = req.body;
     if (!shipping_address) return res.status(400).json({ error: 'Shipping address required' });
-    const cartItems = all(`SELECT c.*, p.price_per_unit, p.farmer_id, p.quantity_available, f.commission_tier
+    const cartItems = all(`SELECT c.*, p.price_per_unit, p.farmer_id, p.name as product_name, p.unit, p.quantity_available, f.commission_tier
                            FROM carts c JOIN products p ON c.product_id=p.id JOIN farmers f ON p.farmer_id=f.id
                            WHERE c.customer_id=?`, [req.user.id]);
     if (!cartItems.length) return res.status(400).json({ error: 'Cart is empty' });
@@ -221,25 +327,39 @@ app.post('/api/orders', requireAuth, async (req, res) => {
     run(`INSERT INTO orders (id,customer_id,total_amount,commission_amount,farmer_payout,shipping_address,shipping_pincode,payment_method,notes)
          VALUES (?,?,?,?,?,?,?,?,?)`,
       [orderId, req.user.id, total, commission, payout, shipping_address, shipping_pincode || '', payment_method, notes || '']);
-    for (const item of cartItems) {
-      const subtotal = item.price_per_unit * item.quantity;
-      run(`INSERT INTO order_items (id,order_id,product_id,farmer_id,quantity,unit_price,subtotal) VALUES (?,?,?,?,?,?,?)`,
-        [uuid(), orderId, item.product_id, item.farmer_id, item.quantity, item.price_per_unit, subtotal]);
-      run('UPDATE products SET quantity_available=quantity_available-? WHERE id=?', [item.quantity, item.product_id]);
-    }
-    // Update farmer annual sales
+    // Group items by farmer for per-farmer notifications
     const byFarmer = {};
     for (const item of cartItems) {
-      byFarmer[item.farmer_id] = (byFarmer[item.farmer_id] || 0) + item.price_per_unit * item.quantity;
+      const sub = item.price_per_unit * item.quantity;
+      run(`INSERT INTO order_items (id,order_id,product_id,farmer_id,quantity,unit_price,subtotal) VALUES (?,?,?,?,?,?,?)`,
+        [uuid(), orderId, item.product_id, item.farmer_id, item.quantity, item.price_per_unit, sub]);
+      run('UPDATE products SET quantity_available=quantity_available-? WHERE id=?', [item.quantity, item.product_id]);
+      if (!byFarmer[item.farmer_id]) byFarmer[item.farmer_id] = [];
+      byFarmer[item.farmer_id].push(item);
     }
-    for (const [fid, amount] of Object.entries(byFarmer)) {
-      run('UPDATE farmers SET annual_sales=annual_sales+?, total_orders=total_orders+1 WHERE id=?', [amount, fid]);
+    // Update farmer stats + tier
+    for (const [fid, items] of Object.entries(byFarmer)) {
+      const farmerTotal = items.reduce((s, i) => s + i.price_per_unit * i.quantity, 0);
+      run('UPDATE farmers SET annual_sales=annual_sales+?, total_orders=total_orders+1 WHERE id=?', [farmerTotal, fid]);
       const f = get('SELECT annual_sales FROM farmers WHERE id=?', [fid]);
-      const newTier = determineTier(f?.annual_sales || 0);
-      run('UPDATE farmers SET commission_tier=? WHERE id=?', [newTier, fid]);
+      run('UPDATE farmers SET commission_tier=? WHERE id=?', [determineTier(f?.annual_sales || 0), fid]);
     }
     run('DELETE FROM carts WHERE customer_id=?', [req.user.id]);
-    res.json({ order: get('SELECT * FROM orders WHERE id=?', [orderId]) });
+    const order = get('SELECT * FROM orders WHERE id=?', [orderId]);
+    const customerUser = get('SELECT * FROM users WHERE id=?', [req.user.id]);
+    const orderItems = all(`SELECT oi.*, p.name as product_name, p.unit FROM order_items oi
+                            JOIN products p ON oi.product_id=p.id WHERE oi.order_id=?`, [orderId]);
+    // Email customer confirmation
+    if (customerUser) email.sendOrderConfirmation(customerUser, order, orderItems).catch(() => {});
+    // Email each farmer involved
+    for (const [fid, items] of Object.entries(byFarmer)) {
+      const farmerRec = get('SELECT * FROM farmers WHERE id=?', [fid]);
+      if (farmerRec) {
+        const farmerUser = get('SELECT * FROM users WHERE id=?', [farmerRec.user_id]);
+        if (farmerUser) email.sendFarmerNewOrder(farmerUser, items, customerUser?.name || 'A customer', orderId).catch(() => {});
+      }
+    }
+    res.json({ order });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -250,12 +370,12 @@ app.get('/api/orders', requireAuth, async (req, res) => {
   }
   if (req.user.role === 'farmer') {
     const farmer = get('SELECT id FROM farmers WHERE user_id=?', [req.user.id]);
-    const items = all(`SELECT oi.*, o.created_at, o.status, o.shipping_address, u.name as customer_name, p.name as product_name
-                       FROM order_items oi JOIN orders o ON oi.order_id=o.id JOIN users u ON o.customer_id=u.id JOIN products p ON oi.product_id=p.id
-                       WHERE oi.farmer_id=? ORDER BY o.created_at DESC`, [farmer?.id]);
-    return res.json(items);
+    return res.json(all(`SELECT oi.*, o.created_at, o.status, o.shipping_address, u.name as customer_name, p.name as product_name
+                         FROM order_items oi JOIN orders o ON oi.order_id=o.id JOIN users u ON o.customer_id=u.id
+                         JOIN products p ON oi.product_id=p.id
+                         WHERE oi.farmer_id=? ORDER BY o.created_at DESC`, [farmer?.id]));
   }
-  res.json(all(`SELECT o.* FROM orders o WHERE o.customer_id=? ORDER BY o.created_at DESC`, [req.user.id]));
+  res.json(all(`SELECT * FROM orders WHERE customer_id=? ORDER BY created_at DESC`, [req.user.id]));
 });
 
 app.get('/api/orders/:id', requireAuth, async (req, res) => {
@@ -263,7 +383,8 @@ app.get('/api/orders/:id', requireAuth, async (req, res) => {
   const order = get('SELECT * FROM orders WHERE id=?', [req.params.id]);
   if (!order) return res.status(404).json({ error: 'Order not found' });
   const items = all(`SELECT oi.*, p.name as product_name, p.unit, u.name as farmer_name, f.district, f.state
-                     FROM order_items oi JOIN products p ON oi.product_id=p.id JOIN farmers f ON oi.farmer_id=f.id JOIN users u ON f.user_id=u.id
+                     FROM order_items oi JOIN products p ON oi.product_id=p.id
+                     JOIN farmers f ON oi.farmer_id=f.id JOIN users u ON f.user_id=u.id
                      WHERE oi.order_id=?`, [req.params.id]);
   res.json({ order, items });
 });
@@ -276,7 +397,7 @@ app.put('/api/orders/:id/status', requireAuth, async (req, res) => {
   res.json({ success: true });
 });
 
-// ─── SUBSCRIPTIONS ───────────────────────────────────────────
+// ─── SUBSCRIPTIONS ────────────────────────────────────────────────────────────
 app.post('/api/subscriptions', requireAuth, async (req, res) => {
   await getDb();
   const { box_type, cadence, address, pincode, special_instructions, items } = req.body;
@@ -287,7 +408,7 @@ app.post('/api/subscriptions', requireAuth, async (req, res) => {
   run(`INSERT INTO subscriptions (id,customer_id,box_type,cadence,address,pincode,special_instructions,next_delivery)
        VALUES (?,?,?,?,?,?,?,?)`,
     [id, req.user.id, box_type, cadence, address, pincode || '', special_instructions || '', next.toISOString().split('T')[0]]);
-  if (items && Array.isArray(items)) {
+  if (items?.length) {
     for (const item of items) {
       run('INSERT INTO subscription_items (id,subscription_id,product_id,quantity) VALUES (?,?,?,?)',
         [uuid(), id, item.product_id, item.quantity]);
@@ -300,7 +421,8 @@ app.get('/api/subscriptions', requireAuth, async (req, res) => {
   await getDb();
   const subs = all('SELECT * FROM subscriptions WHERE customer_id=? ORDER BY created_at DESC', [req.user.id]);
   for (const s of subs) {
-    s.items = all(`SELECT si.*, p.name, p.price_per_unit, p.unit FROM subscription_items si JOIN products p ON si.product_id=p.id WHERE si.subscription_id=?`, [s.id]);
+    s.items = all(`SELECT si.*, p.name, p.price_per_unit, p.unit FROM subscription_items si
+                   JOIN products p ON si.product_id=p.id WHERE si.subscription_id=?`, [s.id]);
   }
   res.json(subs);
 });
@@ -317,7 +439,7 @@ app.put('/api/subscriptions/:id/resume', requireAuth, async (req, res) => {
   res.json({ success: true });
 });
 
-// ─── COMMUNITY ───────────────────────────────────────────────
+// ─── COMMUNITY ────────────────────────────────────────────────────────────────
 app.get('/api/community/posts', async (req, res) => {
   await getDb();
   const { category } = req.query;
@@ -344,7 +466,9 @@ app.post('/api/community/posts', requireAuth, requireRole('farmer'), async (req,
 
 app.get('/api/community/posts/:id/replies', async (req, res) => {
   await getDb();
-  res.json(all(`SELECT cr.*, u.name as farmer_name, f.district, f.state FROM community_replies cr JOIN farmers f ON cr.farmer_id=f.id JOIN users u ON f.user_id=u.id WHERE cr.post_id=? ORDER BY cr.created_at ASC`, [req.params.id]));
+  res.json(all(`SELECT cr.*, u.name as farmer_name, f.district, f.state
+                FROM community_replies cr JOIN farmers f ON cr.farmer_id=f.id JOIN users u ON f.user_id=u.id
+                WHERE cr.post_id=? ORDER BY cr.created_at ASC`, [req.params.id]));
 });
 
 app.post('/api/community/posts/:id/replies', requireAuth, requireRole('farmer'), async (req, res) => {
@@ -365,45 +489,47 @@ app.post('/api/community/posts/:id/like', async (req, res) => {
   res.json({ success: true });
 });
 
-// ─── ADMIN DASHBOARD ─────────────────────────────────────────
+// ─── ADMIN ────────────────────────────────────────────────────────────────────
 app.get('/api/admin/stats', requireAuth, requireRole('admin'), async (req, res) => {
   await getDb();
   res.json({
-    total_farmers: get('SELECT COUNT(*) as n FROM farmers')?.n || 0,
-    verified_farmers: get("SELECT COUNT(*) as n FROM farmers WHERE verification_status='verified'")?.n || 0,
-    pending_farmers: get("SELECT COUNT(*) as n FROM farmers WHERE verification_status='pending'")?.n || 0,
-    total_products: get('SELECT COUNT(*) as n FROM products WHERE is_active=1')?.n || 0,
-    total_orders: get('SELECT COUNT(*) as n FROM orders')?.n || 0,
-    total_revenue: get('SELECT SUM(total_amount) as n FROM orders')?.n || 0,
-    total_commission: get('SELECT SUM(commission_amount) as n FROM orders')?.n || 0,
-    total_customers: get("SELECT COUNT(*) as n FROM users WHERE role='customer'")?.n || 0,
+    total_farmers:        get('SELECT COUNT(*) as n FROM farmers')?.n || 0,
+    verified_farmers:     get("SELECT COUNT(*) as n FROM farmers WHERE verification_status='verified'")?.n || 0,
+    pending_farmers:      get("SELECT COUNT(*) as n FROM farmers WHERE verification_status='pending'")?.n || 0,
+    total_products:       get('SELECT COUNT(*) as n FROM products WHERE is_active=1')?.n || 0,
+    total_orders:         get('SELECT COUNT(*) as n FROM orders')?.n || 0,
+    total_revenue:        get('SELECT SUM(total_amount) as n FROM orders')?.n || 0,
+    total_commission:     get('SELECT SUM(commission_amount) as n FROM orders')?.n || 0,
+    total_customers:      get("SELECT COUNT(*) as n FROM users WHERE role='customer'")?.n || 0,
     active_subscriptions: get("SELECT COUNT(*) as n FROM subscriptions WHERE status='active'")?.n || 0,
   });
 });
 
-// ─── CATEGORIES ──────────────────────────────────────────────
+// ─── MISC ─────────────────────────────────────────────────────────────────────
 app.get('/api/categories', async (req, res) => {
   await getDb();
   res.json(all("SELECT DISTINCT category FROM products WHERE is_active=1 ORDER BY category"));
 });
 
-// ─── SPA FALLBACK ─────────────────────────────────────────────
 app.get('*', (req, res) => {
-  if (req.path.startsWith('/api')) return res.status(404).json({ error: 'API route not found' });
+  if (req.path.startsWith('/api')) return res.status(404).json({ error: 'Not found' });
   res.sendFile(path.join(__dirname, '../public/index.html'));
 });
 
-// ─── START ───────────────────────────────────────────────────
+// ─── SAFETY NET ──────────────────────────────────────────────────────────────
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled rejection (non-fatal):', reason?.message || reason);
+});
+
+// ─── START ────────────────────────────────────────────────────────────────────
 getDb().then(() => {
   app.listen(PORT, () => {
-    console.log(`\n🌾  KhetSe is running!`);
+    console.log(`\n🌾  KhetSe v1.1 is running!`);
     console.log(`   → http://localhost:${PORT}\n`);
-    console.log(`   Test accounts:`);
     console.log(`   Admin:    admin@khetse.in   / admin123`);
     console.log(`   Farmer:   ramesh@farmer.in  / farmer123`);
     console.log(`   Customer: priya@customer.in / customer123\n`);
+    const emailMode = process.env.SMTP_USER ? `Gmail (${process.env.SMTP_USER})` : 'Ethereal (test)';
+    console.log(`   Email:    ${emailMode}`);
   });
-}).catch(e => {
-  console.error('Failed to start:', e.message);
-  process.exit(1);
-});
+}).catch(e => { console.error('Startup failed:', e.message); process.exit(1); });
