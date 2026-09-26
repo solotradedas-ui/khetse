@@ -46,8 +46,8 @@ async function getTransporter() {
   return transporter;
 }
 
-const FROM = process.env.SMTP_FROM || '"KhetSe Platform" <noreply@khetse.in>';
-const ADMIN_EMAIL = process.env.ADMIN_EMAIL || process.env.SMTP_USER || 'admin@khetse.in';
+const FROM = process.env.SMTP_FROM || '"KhetSe Platform" <solotradedas@gmail.com>';
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL || process.env.SMTP_USER || 'solotradedas@gmail.com';
 const BASE_URL = process.env.BASE_URL || 'http://localhost:3000';
 
 // ─── SEND HELPER ─────────────────────────────────────────────────────────────
@@ -137,7 +137,7 @@ async function sendWelcomeFarmer(user) {
     </div>
     <a class="cta" href="${BASE_URL}/#farmer-register">Complete farm profile →</a>
     <hr class="divider">
-    <p style="font-size:13px;color:#8A7A68">Questions? Reply to this email or contact us at support@khetse.in</p>
+    <p style="font-size:13px;color:#8A7A68">Questions? Reply to this email or contact us at solotradedas@khetse.in</p>
   `));
 }
 
